@@ -255,6 +255,72 @@ export function createResourceBridge(options: {
     return details.type === "media" || isCatCatchMedia(extension, meta.mime);
   }
 
+  // 判断 Content-Type 是否为浏览器会触发下载的类型（导航转下载场景）。
+  // 参考 FluxDown 的 isDownloadContentType：覆盖常见二进制/文档/媒体类型。
+  function isDownloadContentType(contentType: string): boolean {
+    const ct = contentType.toLowerCase().split(";")[0].trim();
+    if (!ct) {
+      return false;
+    }
+    const downloadTypes = [
+      "application/octet-stream",
+      "application/x-download",
+      "application/force-download",
+      "application/zip",
+      "application/x-rar-compressed",
+      "application/x-7z-compressed",
+      "application/gzip",
+      "application/x-tar",
+      "application/x-bzip2",
+      "application/x-xz",
+      "application/x-msdownload",
+      "application/x-msi",
+      "application/x-apple-diskimage",
+      "application/vnd.debian.binary-package",
+      "application/x-iso9660-image",
+      "application/x-raw-disk-image",
+      "application/pdf",
+      "application/vnd.android.package-archive",
+      "application/x-bittorrent",
+    ];
+    if (downloadTypes.includes(ct)) {
+      return true;
+    }
+    if (ct.startsWith("video/") || ct.startsWith("audio/")) {
+      return true;
+    }
+    if (ct.startsWith("application/vnd.openxmlformats-officedocument")) {
+      return true;
+    }
+    if (ct.startsWith("application/vnd.ms-")) {
+      return true;
+    }
+    return false;
+  }
+
+  // 判断响应头是否指示这是一个"下载"响应（Content-Disposition: attachment 或下载类 Content-Type）。
+  // 用于 Firefox blocking 拦截层从源头取消下载请求。
+  function isDownloadResponse(meta: NetworkResponseMeta, disposition: string): boolean {
+    if (disposition.toLowerCase().startsWith("attachment")) {
+      return true;
+    }
+    return isDownloadContentType(meta.mime);
+  }
+
+  // 从 Content-Disposition 头解析文件名（与 toResponseMeta 中的逻辑一致，但独立提取以便 blocking 层复用）。
+  function parseDispositionFilename(disposition: string): string {
+    if (!disposition) {
+      return "";
+    }
+    const match = /filename\*\s*=\s*UTF-8''([^;]+)|filename\s*=\s*"?([^";]+)"?/i.exec(disposition);
+    const filename = match?.[1] ?? match?.[2] ?? "";
+    try {
+      return basenameOf(decodeURIComponent(filename));
+    } catch {
+      return basenameOf(filename);
+    }
+  }
+
   function shouldCaptureRequestResource(details: chrome.webRequest.OnSendHeadersDetails): boolean {
     if (!isCapturableUrl(details.url)) {
       return false;
@@ -452,6 +518,109 @@ export function createResourceBridge(options: {
       // Browser download was already intercepted — the user already lost it from the
       // browser's download tray, so a desktop handoff failure here is unrecoverable anyway.
     }
+  }
+
+  // Firefox 专用：从源头拦截下载请求（blocking webRequest）。
+  //
+  // Firefox 无 chrome.downloads.onDeterminingFilename，只能靠 onCreated 后 cancel+erase，
+  // 但 Firefox 的 downloads.erase 对主动取消的记录删除不可靠，导致下载器残留一条"已取消"
+  // 记录，且每次下载都弹"另存为"确认框。
+  //
+  // 根治：Firefox MV3 仍支持 blocking webRequest。对判定为下载的导航响应直接返回
+  // {cancel:true}，浏览器根本不创建下载项 → 无任何残留记录、无弹窗。
+  // 同步做拦截决策，异步 fire-and-forget 发送到桌面客户端（不阻塞响应管线）。
+  //
+  // 仅拦截 main_frame / sub_frame 导航类请求（点击下载链接 / 导航转下载）；
+  // xhr/fetch 取 blob 不碰（那些由资源嗅探层处理）。
+  function interceptDownloadAtSource(
+    details: chrome.webRequest.OnHeadersReceivedDetails,
+    filters: { shouldTakeDownloads: boolean; minTakeSizeKB: number; shouldTakeUnknownSize: boolean },
+  ): chrome.webRequest.BlockingResponse | undefined {
+    // 只拦截导航类请求（点击下载链接 / 导航转下载）；xhr/fetch 取 blob 不碰
+    if (details.type !== "main_frame" && details.type !== "sub_frame") {
+      return undefined;
+    }
+    if (!details.responseHeaders) {
+      return undefined;
+    }
+    // 仅成功响应（重定向/错误交给浏览器）
+    if (details.statusCode < 200 || details.statusCode >= 300) {
+      return undefined;
+    }
+
+    const meta = toResponseMeta(details.responseHeaders);
+    // 取 Content-Disposition 原始值判断 attachment
+    let disposition = "";
+    for (const h of details.responseHeaders) {
+      if (h.name?.toLowerCase() === "content-disposition" && h.value) {
+        disposition = h.value;
+        break;
+      }
+    }
+
+    if (!isDownloadResponse(meta, disposition)) {
+      return undefined;
+    }
+
+    // 拦截开关关闭 → 放行
+    if (!filters.shouldTakeDownloads) {
+      return undefined;
+    }
+
+    // 非 http(s) → 放行
+    if (!isCapturableUrl(details.url)) {
+      return undefined;
+    }
+
+    // 最小尺寸过滤
+    if (filters.minTakeSizeKB > 0) {
+      const totalBytes = meta.size;
+      if (totalBytes <= 0 && !filters.shouldTakeUnknownSize) {
+        return undefined;
+      }
+      if (totalBytes > 0 && totalBytes < filters.minTakeSizeKB * 1024) {
+        return undefined;
+      }
+    }
+
+    // 命中：同步取消该请求（浏览器不创建下载项），异步发送到桌面客户端
+    const filename =
+      parseDispositionFilename(disposition)
+      || basenameOf(meta.filename)
+      || basenameOf(filenameFromUrl(details.url))
+      || "resource";
+
+    const headerSnapshot = cache.headerSnapshotByUrl(details.url);
+    const headers = { ...(headerSnapshot?.headers ?? {}) };
+    // 补全 referer：优先用 headerSnapshot，否则用 initiator / originUrl（Firefox）
+    const initiator = initiatorOf(details);
+    const originUrl = (details as chrome.webRequest.WebRequestDetails & { originUrl?: string }).originUrl;
+    if (!headers.referer) {
+      headers.referer = initiator || originUrl || "";
+    }
+
+    // fire-and-forget：blocking 回调必须尽快返回；发送失败时静默（浏览器已取消，无法回退）
+    void options.sendDesktopRequest<CommandResult>({
+      type: "create_task",
+      source: "download",
+      title: filename,
+      payload: {
+        url: details.url,
+        headers,
+        filename,
+        size: meta.size > 0 ? meta.size : (headerSnapshot?.size ?? 0),
+        supportsRange: Boolean(meta.supportsRange || headerSnapshot?.supportsRange),
+      },
+    }).then((result) => {
+      if (result.ok) {
+        void openActionPopup();
+      }
+    }).catch(() => {
+      // 发送失败：浏览器已取消该请求，无法回退到浏览器下载。
+      // 任务已入队（sendTaskOrEnqueue），桌面端重连后会补发。
+    });
+
+    return { cancel: true };
   }
 
   async function sendHttpResourceToDesktop(resource: Resource): Promise<CommandResult> {
@@ -731,6 +900,7 @@ export function createResourceBridge(options: {
       cache.enrichTabPoster(tabId, posterUrl),
     headersForPage: (pageUrl: string) => cache.headersForPage(pageUrl),
     routeBrowserDownload,
+    interceptDownloadAtSource,
     onNavigationCommitted,
     onRequestHeaders,
     onTabRemoved,

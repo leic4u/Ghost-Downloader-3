@@ -24,7 +24,7 @@ import {
     openActionPopup,
     queryTabs,
 } from "./background/chrome-helpers";
-import {onSendHeadersExtraInfoSpec, supportsDownloadDeterminingFilename,} from "./shared/browser";
+import {onSendHeadersExtraInfoSpec, supportsDownloadDeterminingFilename, isFirefox,} from "./shared/browser";
 import {loadBaseIcons, updateIconForTasks} from "./background/icon-progress";
 import {enqueue, flush, pendingCount} from "./background/task-queue";
 
@@ -308,6 +308,29 @@ chrome.webRequest.onResponseStarted.addListener(
   { urls: ["<all_urls>"] },
   ["responseHeaders"],
 );
+
+// Firefox 专用：从源头拦截下载请求（blocking webRequest）。
+//
+// Firefox 无 chrome.downloads.onDeterminingFilename，只能靠 onCreated 后 cancel+erase，
+// 但 Firefox 的 downloads.erase 对主动取消的记录删除不可靠，导致下载器残留一条"已取消"
+// 记录，且每次下载都弹"另存为"确认框。
+//
+// 根治：Firefox MV3 仍支持 blocking webRequest。对判定为下载的导航响应直接返回
+// {cancel:true}，浏览器根本不创建下载项 → 无任何残留记录、无弹窗。
+// Chrome 走 onDeterminingFilename 干净路径，不需要此层。
+if (isFirefox()) {
+  chrome.webRequest.onHeadersReceived.addListener(
+    (details) => {
+      return resourceBridge.interceptDownloadAtSource(details, {
+        shouldTakeDownloads,
+        minTakeSizeKB,
+        shouldTakeUnknownSize,
+      });
+    },
+    { urls: ["<all_urls>"], types: ["main_frame", "sub_frame"] },
+    ["blocking", "responseHeaders"],
+  );
+}
 
 let bypassNextDownload = false;
 let bypassTimer = 0;

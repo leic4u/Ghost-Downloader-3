@@ -33,3 +33,7 @@ export function onSendHeadersExtraInfoSpec(): chrome.webRequest.OnSendHeadersOpt
 export function supportsDownloadDeterminingFilename(): boolean {
   return Boolean(chrome.downloads?.onDeterminingFilename?.addListener);
 }
+
+export function isFirefox(): boolean {
+  return extensionBrowserTarget() === "firefox";
+}

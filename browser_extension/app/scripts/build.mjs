@@ -46,6 +46,11 @@ function createManifest(target) {
     delete manifest.minimum_chrome_version;
     delete manifest.side_panel;
     manifest.permissions = manifest.permissions.filter(p => p !== "sidePanel");
+    // Firefox MV3 blocking webRequest 需要 webRequestBlocking 权限，
+    // 用于从源头拦截下载请求（避免 onCreated 后 cancel+erase 残留"已取消"记录）。
+    if (!manifest.permissions.includes("webRequestBlocking")) {
+      manifest.permissions.push("webRequestBlocking");
+    }
     return manifest;
   }
 
